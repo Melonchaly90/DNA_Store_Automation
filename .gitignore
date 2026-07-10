@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+dna_thrift.db
+.pytest_cache/
