@@ -99,6 +99,8 @@ def ask_gemini_about_shoe(image_path: str) -> str:
     )
     response.raise_for_status()
     data = response.json()
+    if "choices" not in data:
+        raise ValueError(f"OpenRouter response missing 'choices': {data}")
     return data["choices"][0]["message"]["content"]
 
 
