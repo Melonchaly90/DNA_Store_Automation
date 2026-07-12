@@ -1,4 +1,4 @@
-# DNA Thrift Shoes — WhatsApp AI Automation
+# DNA Thrift Shoes WhatsApp AI Automation
 
 A conversational AI agent for DNA Thrift, a premium thrift shoe brand, built for the Khizex AI Engineering Internship. Customers message a description or photo of a shoe on WhatsApp; the bot identifies the shoe, reads its size, checks inventory, and replies with name, condition-adjusted price, and availability.
 
