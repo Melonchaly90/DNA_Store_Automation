@@ -30,6 +30,10 @@ app = FastAPI()
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+@app.get("/")
+async def root():
+    return {"status": "DNA Thrift bot is live", "message": "Send a POST to /webhook to interact"}
+
 
 def verify_webhook_signature(payload_bytes: bytes, signature_header: str) -> bool:
     """
