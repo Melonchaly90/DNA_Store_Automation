@@ -1,9 +1,16 @@
 import logging
 import sqlite3
 import re
+import os
+import hmac
+import hashlib
+import json
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from models.webhook_payload import WhatsAppWebhookPayload, WhatsAppMessage
 from conversation.state_machine import ConversationStateMachine
@@ -17,7 +24,33 @@ from inventory.pricing import calculate_price
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Rate limiter setup
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI()
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+def verify_webhook_signature(payload_bytes: bytes, signature_header: str) -> bool:
+    """
+    Verifies the WhatsApp webhook signature using HMAC-SHA256.
+    Compares the expected signature against the X-Hub-Signature-256 header.
+    """
+    secret = os.getenv("WHATSAPP_WEBHOOK_SECRET", "")
+    if not secret:
+        logger.warning("WHATSAPP_WEBHOOK_SECRET not set")
+        return False
+
+    expected = hmac.new(
+        secret.encode("utf-8"),
+        payload_bytes,
+        hashlib.sha256
+    ).hexdigest()
+
+    # Strip the "sha256=" prefix if present
+    received = signature_header.removeprefix("sha256=")
+
+    return hmac.compare_digest(expected, received)
 
 # Global instances
 session_store = SessionStore()
@@ -235,9 +268,20 @@ def process_customer_message(message: WhatsAppMessage) -> str:
 
 
 @app.post("/webhook")
+@limiter.limit("10/minute")
 async def webhook(request: Request):
+    # 1. Signature verification
+    raw_body = await request.body()
+    signature_header = request.headers.get("X-Hub-Signature-256", "")
+    if not verify_webhook_signature(raw_body, signature_header):
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"detail": "Unauthorized"}
+        )
+
+    # 2. Parse JSON body
     try:
-        body = await request.json()
+        body = json.loads(raw_body)
     except Exception as e:
         logger.error(f"Request body is not valid JSON: {e}")
         return JSONResponse(
@@ -245,15 +289,17 @@ async def webhook(request: Request):
             content={"detail": "Invalid JSON body"}
         )
 
+    # 3. Validate against Pydantic model
     try:
         payload = WhatsAppWebhookPayload(**body)
     except ValidationError as e:
         logger.error(f"WhatsApp webhook payload validation failed: {e}")
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
-            content={"detail": "Validation failed", "errors": e.errors()}
+            content={"detail": "Invalid payload"}
         )
 
+    # 4. Process messages
     last_reply = "No messages processed"
     for entry in payload.entry:
         for change in entry.changes:

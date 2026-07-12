@@ -1,9 +1,38 @@
 import pytest
+import os
+import json
+import hmac
+import hashlib
 import sqlite3
 from fastapi.testclient import TestClient
 from webhook.main import app, session_store, last_query_cache
 
+# Test secret — set in the environment before importing the app
+TEST_SECRET = "test_webhook_secret_key_12345"
+os.environ["WHATSAPP_WEBHOOK_SECRET"] = TEST_SECRET
+
 client = TestClient(app)
+
+
+def _sign(payload: dict) -> str:
+    """Compute the sha256=<hex> signature for a JSON payload using the test secret."""
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    sig = hmac.new(TEST_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return f"sha256={sig}"
+
+
+def _post_webhook(payload: dict):
+    """POST to /webhook with a valid HMAC signature header."""
+    body_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    sig = hmac.new(TEST_SECRET.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
+    return client.post(
+        "/webhook",
+        content=body_bytes,
+        headers={
+            "Content-Type": "application/json",
+            "X-Hub-Signature-256": f"sha256={sig}",
+        },
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -24,7 +53,6 @@ def setup_db_and_clean_store():
     );
     """)
     conn.execute("DELETE FROM inventory;")
-    # Insert test items
     conn.execute("""
     INSERT INTO inventory (brand, model_name, size, size_unit, condition_score, base_price, in_stock)
     VALUES ('Nike', 'Air Jordan 1', 10.0, 'US', 8, 10000.0, 1);
@@ -40,6 +68,30 @@ def setup_db_and_clean_store():
     session_store._sessions.clear()
     last_query_cache.clear()
 
+
+# ── Security Tests ──────────────────────────────────────────────────────
+
+def test_missing_signature_returns_401():
+    """Request without X-Hub-Signature-256 header should be rejected."""
+    payload = {"object": "whatsapp_business_account", "entry": []}
+    response = client.post("/webhook", json=payload)
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Unauthorized"
+
+
+def test_bad_signature_returns_401():
+    """Request with an incorrect signature should be rejected."""
+    payload = {"object": "whatsapp_business_account", "entry": []}
+    response = client.post(
+        "/webhook",
+        json=payload,
+        headers={"X-Hub-Signature-256": "sha256=badhex0000"},
+    )
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Unauthorized"
+
+
+# ── Existing Tests (updated with signature) ─────────────────────────────
 
 def test_webhook_valid_payload():
     sample_payload = {
@@ -69,7 +121,7 @@ def test_webhook_valid_payload():
         ]
     }
 
-    response = client.post("/webhook", json=sample_payload)
+    response = _post_webhook(sample_payload)
     assert response.status_code == 200
     assert "We found Nike Air Jordan 1 in size 10.0 US!" in response.json()["reply"]
 
@@ -92,19 +144,17 @@ def test_webhook_invalid_payload():
         ]
     }
 
-    response = client.post("/webhook", json=invalid_payload)
+    response = _post_webhook(invalid_payload)
     assert response.status_code == 400
-    assert "Validation failed" in response.json()["detail"]
+    assert response.json()["detail"] == "Invalid payload"
+    # Verify internal errors are NOT leaked
+    assert "errors" not in response.json()
 
 
-# ── Integration Tests requested by User ─────────────────────────────────
+# ── Integration Tests ───────────────────────────────────────────────────
 
 def test_full_text_query_exact_match():
-    """
-    Integration Test 1: Full text query with exact match.
-    Customer texts: "looking for Adidas Samba size 9"
-    Should result in: Exact match found in inventory, state goes to AWAITING_PURCHASE_INTENT.
-    """
+    """Full text query with exact match."""
     payload = {
         "object": "whatsapp_business_account",
         "entry": [{
@@ -126,25 +176,18 @@ def test_full_text_query_exact_match():
         }]
     }
 
-    response = client.post("/webhook", json=payload)
+    response = _post_webhook(payload)
     assert response.status_code == 200
     reply = response.json()["reply"]
     assert "We found Adidas Samba in size 9.0 US!" in reply
     assert "Would you like to buy it?" in reply
 
-    # Verify session state is updated
     session = session_store.get_or_create("1112223333")
     assert session.current_state == "AWAITING_PURCHASE_INTENT"
 
 
 def test_text_query_missing_size_then_confirmation():
-    """
-    Integration Test 2: Text query with missing size followed by a size-confirmation message.
-    1. Customer texts: "looking for Nike Air Jordan 1"
-       Should reply asking for size. State: AWAITING_SIZE_CONFIRMATION.
-    2. Customer texts: "size 10" (or just "10")
-       Should reply finding the exact match. State: AWAITING_PURCHASE_INTENT.
-    """
+    """Text query with missing size followed by a size-confirmation message."""
     phone = "4445556666"
 
     # Step 1: Missing size query
@@ -169,7 +212,7 @@ def test_text_query_missing_size_then_confirmation():
         }]
     }
 
-    response1 = client.post("/webhook", json=payload1)
+    response1 = _post_webhook(payload1)
     assert response1.status_code == 200
     reply1 = response1.json()["reply"]
     assert "What size (US/UK/EU) are you looking for in the Nike Air Jordan 1?" in reply1
@@ -199,7 +242,7 @@ def test_text_query_missing_size_then_confirmation():
         }]
     }
 
-    response2 = client.post("/webhook", json=payload2)
+    response2 = _post_webhook(payload2)
     assert response2.status_code == 200
     reply2 = response2.json()["reply"]
     assert "We found an exact match for Nike Air Jordan 1 in size 10.0 US" in reply2
@@ -209,11 +252,7 @@ def test_text_query_missing_size_then_confirmation():
 
 
 def test_two_consecutive_unclear_messages_trigger_failed():
-    """
-    Integration Test 3: Two consecutive unclear messages trigger CLARIFICATION_FAILED handoff.
-    1st message: "hello" -> returns specific query instruction. attempts -> 1
-    2nd message: "what up" -> triggers CLARIFICATION_FAILED.
-    """
+    """Two consecutive unclear messages trigger CLARIFICATION_FAILED handoff."""
     phone = "7778889999"
 
     # Message 1
@@ -238,7 +277,7 @@ def test_two_consecutive_unclear_messages_trigger_failed():
         }]
     }
 
-    response1 = client.post("/webhook", json=payload1)
+    response1 = _post_webhook(payload1)
     assert response1.status_code == 200
     assert "please be more specific" in response1.json()["reply"].lower()
 
@@ -268,14 +307,10 @@ def test_two_consecutive_unclear_messages_trigger_failed():
         }]
     }
 
-    response2 = client.post("/webhook", json=payload2)
+    response2 = _post_webhook(payload2)
     assert response2.status_code == 200
     reply2 = response2.json()["reply"]
     assert "human handoff" in reply2.lower()
 
-    # Verify session landed in CLARIFICATION_FAILED
-    # Note: Immediately after landing in CLARIFICATION_FAILED, the next incoming message
-    # will transition it back out to AWAITING_QUERY.
-    # Our session state right now (after the 2nd message finished processing) is CLARIFICATION_FAILED.
     session = session_store.get_or_create(phone)
     assert session.current_state == "CLARIFICATION_FAILED"
