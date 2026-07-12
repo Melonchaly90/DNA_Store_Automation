@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: dna-thrift-webhook
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn webhook.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: WHATSAPP_WEBHOOK_SECRET
+        sync: false

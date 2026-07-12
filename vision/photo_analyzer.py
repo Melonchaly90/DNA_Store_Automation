@@ -13,8 +13,14 @@ from models.shoe_query import ShoeQuery
 # Setup logging
 logger = logging.getLogger(__name__)
 
+import shutil
+
 # Configure pytesseract path
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+tesseract_path = shutil.which("tesseract")
+if tesseract_path:
+    pytesseract.pytesseract.tesseract_cmd = tesseract_path
+else:
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 
 def run_ocr(image_path: str) -> str:
